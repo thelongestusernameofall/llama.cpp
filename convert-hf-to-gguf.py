@@ -1591,6 +1591,87 @@ class QwenModel(Model):
 class Qwen2Model(Model):
     model_arch = gguf.MODEL_ARCH.QWEN2
 
+@Model.register("HongshuLMHeadModel")
+class QwenModel(Model):
+    model_arch = gguf.MODEL_ARCH.HONGSHU
+
+    @staticmethod
+    def token_bytes_to_string(b):
+        from transformers.models.gpt2.tokenization_gpt2 import bytes_to_unicode
+        byte_encoder = bytes_to_unicode()
+        return ''.join([byte_encoder[ord(char)] for char in b.decode('latin-1')])
+
+    @staticmethod
+    def bpe(mergeable_ranks: dict[bytes, int], token: bytes, max_rank: int | None = None) -> list[bytes]:
+        parts = [bytes([b]) for b in token]
+        while True:
+            min_idx = None
+            min_rank = None
+            for i, pair in enumerate(zip(parts[:-1], parts[1:])):
+                rank = mergeable_ranks.get(pair[0] + pair[1])
+                if rank is not None and (min_rank is None or rank < min_rank):
+                    min_idx = i
+                    min_rank = rank
+            if min_rank is None or (max_rank is not None and min_rank >= max_rank):
+                break
+            assert min_idx is not None
+            parts = parts[:min_idx] + [parts[min_idx] + parts[min_idx + 1]] + parts[min_idx + 2:]
+        return parts
+
+    def set_vocab(self):
+        self._set_vocab_qwen()
+
+    def set_gguf_parameters(self):
+        self.gguf_writer.add_name("Qwen")
+        self.gguf_writer.add_context_length(self.hparams["max_position_embeddings"])
+        self.gguf_writer.add_block_count(self.hparams["num_hidden_layers"])
+        self.gguf_writer.add_embedding_length(self.hparams["hidden_size"])
+        self.gguf_writer.add_feed_forward_length(self.hparams["intermediate_size"])
+        self.gguf_writer.add_rope_freq_base(self.hparams["rotary_emb_base"])
+        self.gguf_writer.add_rope_dimension_count(self.hparams["hidden_size"] // self.hparams["num_attention_heads"])
+        self.gguf_writer.add_head_count(self.hparams["num_attention_heads"])
+        self.gguf_writer.add_layer_norm_rms_eps(self.hparams["layer_norm_epsilon"])
+
+    def write_tensors(self):
+        block_count = self.hparams["num_hidden_layers"]
+        model_kv = dict(self.get_tensors())
+        tensor_map = gguf.get_tensor_name_map(self.model_arch, block_count)
+        for name, data_torch in model_kv.items():
+            # we don't need these
+            if name.endswith(".rotary_emb.inv_freq"):
+                continue
+
+            old_dtype = data_torch.dtype
+
+            # convert any unsupported data types to float32
+            if data_torch.dtype not in (torch.float16, torch.float32):
+                data_torch = data_torch.to(torch.float32)
+
+            data = data_torch.squeeze().numpy()
+
+            # map tensor names
+            new_name = tensor_map.get_name(name, try_suffixes=(".weight", ".bias"))
+            if new_name is None:
+                print(f"Can not map tensor {name!r}")
+                sys.exit()
+
+            n_dims = len(data.shape)
+            data_dtype = data.dtype
+
+            # if f32 desired, convert any float16 to float32
+            if self.ftype == 0 and data_dtype == np.float16:
+                data = data.astype(np.float32)
+
+            # TODO: Why cant we use these float16 as-is? There should be not reason to store float16 as float32
+            if self.ftype == 1 and data_dtype == np.float16 and n_dims == 1:
+                data = data.astype(np.float32)
+
+            # if f16 desired, convert any float32 2-dim weight tensors to float16
+            if self.ftype == 1 and data_dtype == np.float32 and name.endswith(".weight") and n_dims == 2:
+                data = data.astype(np.float16)
+
+            print(f"{new_name}, n_dims = {n_dims}, {old_dtype} --> {data.dtype}")
+            self.gguf_writer.add_tensor(new_name, data)
 
 @Model.register("GPT2LMHeadModel")
 class GPT2Model(Model):
