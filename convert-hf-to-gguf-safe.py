@@ -2456,12 +2456,91 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--bigendian", action="store_true", help="model is executed on big endian machine")
     parser.add_argument(
+        "-k", "--key", type=int, default=0x7e,
+        help="key for encryption, integer. default 0x7e",
+    )
+    parser.add_argument(
+        "-t", "--threads", type=int, default=8,
+        help="threads number for parallel processing",
+    )
+    parser.add_argument(
+        "-f", "--force", action="store_true",
+        help="convert by force, overwrite if output exists",
+    )
+
+    parser.add_argument(
         "model", type=Path,
         help="directory containing model file",
     )
 
     return parser.parse_args()
 
+
+from io import BytesIO
+import struct
+
+from threading import Thread
+from tqdm import tqdm
+import numpy as np
+from multiprocessing import Pool
+import tqdm
+import struct
+
+from multiprocessing import Pool, Manager
+import tqdm
+import struct
+
+def encrypt_segment(data_segment, key, return_dict, segment_id):
+    # 这个函数接收单个数据段和处理过的密钥，返回加密后的数据段
+    processed_key = key % 127
+    encrypted_segment = bytearray(data_segment)
+    for i in range(len(encrypted_segment)):
+        encrypted_segment[i] ^= processed_key
+    # 将处理结果存储在共享字典中
+    return_dict[segment_id] = bytes(encrypted_segment)
+
+def encrypt_file_parallel(input_file, output_file, key, segment_size=100*1024*1024, parallel_size=4):
+    processed_key = key % 127
+
+    # 使用Manager来创建一个共享字典
+    with Manager() as manager:
+        return_dict = manager.dict()
+
+        # 创建进程池
+        with Pool(parallel_size) as pool:
+            # 初始化任务列表和段ID
+            tasks = []
+            segment_id = 0
+
+            # 打开输入文件并逐步读取
+            with open(input_file, 'rb') as f:
+                while True:
+                    data_segment = f.read(segment_size)
+                    if not data_segment:
+                        break  # 文件读取完毕
+                    # 提交任务到进程池，加密当前段
+                    task = pool.apply_async(encrypt_segment, (data_segment, processed_key, return_dict, segment_id))
+                    tasks.append(task)
+                    segment_id += 1
+
+            # 等待所有任务完成
+            for task in tqdm.tqdm(tasks, desc="Encrypting"):
+                task.get()
+
+            # 确保段按正确顺序组合
+            encrypted_data = b''.join([return_dict[i] for i in range(segment_id)])
+
+    # 后续步骤：构建文件头、合并数据等，与之前相同
+    magic = b'QIHO'
+    version = struct.pack('B', 1)
+    padding = b'\x00' * 3
+    original_length_bytes = struct.pack('<Q', len(encrypted_data))
+    key_bytes = struct.pack('<Q', key)
+
+    final_data = magic + version + padding + original_length_bytes + key_bytes + encrypted_data
+
+    with open(output_file, 'wb') as f:
+        f.write(final_data)
 
 def main() -> None:
     args = parse_args()
@@ -2496,29 +2575,42 @@ def main() -> None:
         # output in the same directory as the model by default
         fname_out = dir_model / f'ggml-model-{args.outtype}.gguf'
 
-    print(f"Loading model: {dir_model.name}")
+    if (not os.path.exists(fname_out)) or args.force:
+        print(f"Loading model: {dir_model.name}")
 
-    hparams = Model.load_hparams(dir_model)
+        hparams = Model.load_hparams(dir_model)
 
-    with torch.inference_mode():
-        model_class = Model.from_model_architecture(hparams["architectures"][0])
-        model_instance = model_class(dir_model, ftype_map[args.outtype], fname_out, args.bigendian)
+        with torch.inference_mode():
+            model_class = Model.from_model_architecture(hparams["architectures"][0])
+            model_instance = model_class(dir_model, ftype_map[args.outtype], fname_out, args.bigendian)
 
-        print("Set model parameters")
-        model_instance.set_gguf_parameters()
+            print("Set model parameters")
+            model_instance.set_gguf_parameters()
 
-        print("Set model tokenizer")
-        model_instance.set_vocab()
+            print("Set model tokenizer")
+            model_instance.set_vocab()
 
-        if args.vocab_only:
-            print(f"Exporting model vocab to '{fname_out}'")
-            model_instance.write_vocab()
-        else:
-            print(f"Exporting model to '{fname_out}'")
-            model_instance.write()
+            if args.vocab_only:
+                print(f"Exporting model vocab to '{fname_out}'")
+                model_instance.write_vocab()
+            else:
+                print(f"Exporting model to '{fname_out}'")
+                model_instance.write()
 
-        print(f"Model successfully exported to '{fname_out}'")
+            print(f"Model successfully exported to '{fname_out}'")
+    else:
+        print(f"Model exists, use -f/--force to overwrite... '{fname_out}'")
 
+    
+    qiho_fname_out = f"{fname_out}.qiho"
+    
+    if (not os.path.exists(qiho_fname_out)) or args.force:
+        encrypt_file_parallel(input_file=fname_out,output_file=qiho_fname_out,key=args.key, parallel_size=args.threads) 
+        print(f"Model successfully protected by key {args.key}, saved to {qiho_fname_out}")
+    else:
+        print(f"Model exists, use -f/--force to overwrite... '{qiho_fname_out}'")
+
+    print("Done...")
 
 if __name__ == '__main__':
     main()

@@ -2245,6 +2245,15 @@ extern "C" {
         struct ggml_context ** ctx;
     };
 
+    struct qiho_mm_file {
+        FILE * file;
+        void * data;
+        size_t size;
+    };
+
+    struct qiho_mm_file * qiho_decrpt_file(FILE* file);
+    void qiho_mm_file_free(struct qiho_mm_file **mm_file_ptr);
+
     GGML_API struct gguf_context * gguf_init_empty(void);
     GGML_API struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_params params);
     //GGML_API struct gguf_context * gguf_init_from_buffer(..);

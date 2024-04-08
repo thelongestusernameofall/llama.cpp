@@ -163,6 +163,8 @@ void ggml_print_backtrace(void) {
 #define GGML_VEC_DOT_UNROLL  2
 #define GGML_VEC_MAD_UNROLL  32
 
+#define QIHO_MAGIC_LE "QIHO"
+#define QIHO_MAGIC_BE "OHIQ"
 //
 // logging
 //
@@ -20570,6 +20572,103 @@ struct gguf_context * gguf_init_empty(void) {
     return ctx;
 }
 
+#define QIHO_HEADER_SIZE 24 // Magic(4) + Version(1) + Padding(3) + Original Length(8) + Key(8)
+
+struct qiho_mm_file * qiho_decrpt_file(FILE* file) {
+    // FILE *file = fopen(fname, "rb");
+    if (!file) {
+        return NULL;
+    }
+
+    // 读取文件头信息
+    fseek(file, 0, SEEK_SET);
+    unsigned char header[QIHO_HEADER_SIZE];
+    if (fread(header, 1, QIHO_HEADER_SIZE, file) != QIHO_HEADER_SIZE) {
+        fclose(file);
+        return NULL;
+    }
+
+    // 解析原始文件长度和密钥
+    uint64_t original_length;
+    uint64_t key;
+    memcpy(&original_length, header + 8, sizeof(uint64_t)); // 跳过Magic和Version
+    memcpy(&key, header + 16, sizeof(uint64_t));
+
+    // 分配内存用于存储解密后的原始数据
+    unsigned char *data = (unsigned char *)malloc(original_length);
+    if (!data) {
+        fclose(file);
+        return NULL;
+    }
+
+    // 读取加密数据
+    // unsigned char *encrypted_data = (unsigned char *)malloc(original_length);
+    if (fread(data, 1, original_length, file) != original_length) {
+        free(data);
+        fclose(file);
+        return NULL;
+    }
+
+    // 解密数据
+    uint8_t processed_key = key % 127; // 与加密时相同的处理
+    for (uint64_t i = 0; i < original_length; ++i) {
+        data[i] = data[i] ^ processed_key;
+    }
+
+    // free(encrypted_data);
+    fclose(file);
+
+    file = fmemopen(data, original_length, "rb");
+
+    // 返回指向解密后数据的指针
+    struct qiho_mm_file * mm_file = malloc(sizeof(struct qiho_mm_file));
+    mm_file->data = (void *)data;
+    mm_file->file = file; 
+    mm_file->size = (size_t)original_length;
+    
+    // { //已经验证没问题。dump前后hash完全相同
+    //     //--------- write decrpted data into /tmp/test.bin for debugging ------
+    //     FILE *fp = fopen("/tmp/test.bin", "wb");
+    //     if (fp == NULL) {
+    //         perror("打开文件失败");
+    //         return NULL;
+    //     }
+
+    //     // 写入数据
+    //     if (fwrite(mm_file->data, 1, mm_file->size, fp) != mm_file->size) {
+    //         perror("写入文件失败");
+    //         fclose(fp); // 尝试写入失败时，关闭文件
+    //         return NULL;
+    //     }
+
+    //     // 关闭文件
+    //     fclose(fp);
+    //     //-----------
+    // }
+
+    return mm_file;
+}
+
+void qiho_mm_file_free(struct qiho_mm_file **mm_file_ptr) {
+    if (!mm_file_ptr || !*mm_file_ptr)
+        return;
+
+    struct qiho_mm_file *mm_file = *mm_file_ptr;
+    
+    if (mm_file->file) {
+        fclose(mm_file->file);
+        mm_file->file = NULL;
+    }
+
+    if (mm_file->data) {
+        free(mm_file->data);
+        mm_file->data = NULL;
+    }
+
+    free(mm_file);
+    *mm_file_ptr = NULL; // Now it correctly sets the caller's pointer to NULL
+}
+
 struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_params params) {
     FILE * file = ggml_fopen(fname, "rb");
     if (!file) {
@@ -20581,14 +20680,37 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
 
     char magic[4];
 
+    size_t is_qiho = 0;
+    struct qiho_mm_file * mm_file = NULL;
+
+    // gguf_fread_el(file, &magic, sizeof(magic), &offset);
+    fseek(file, 0, SEEK_SET);
+    if(fread(&magic, 1, sizeof(magic), file)!=sizeof(magic))
+    {
+        fprintf(stderr, "%s: error while reading magic characters '%c%c%c%c'\n", __func__, magic[0], magic[1], magic[2], magic[3]);        
+        fclose(file);
+        return NULL;
+    }
+
+    if ((magic[0] == QIHO_MAGIC_LE[0] && magic[1] == QIHO_MAGIC_LE[1] && magic[2] == QIHO_MAGIC_LE[2] && magic[3] == QIHO_MAGIC_LE[3]) 
+     || (magic[0] == QIHO_MAGIC_BE[0] && magic[1] == QIHO_MAGIC_BE[1] && magic[2] == QIHO_MAGIC_BE[2] && magic[3] == QIHO_MAGIC_BE[3]))
+    {
+        is_qiho = 1;
+        mm_file = qiho_decrpt_file(file);
+        file = mm_file->file;
+
+        offset = 0;
+    }
+    
     // check the magic before making allocations
     {
+        fseek(file, 0, SEEK_SET);
         gguf_fread_el(file, &magic, sizeof(magic), &offset);
 
         for (uint32_t i = 0; i < sizeof(magic); i++) {
             if (magic[i] != GGUF_MAGIC[i]) {
                 fprintf(stderr, "%s: invalid magic characters '%c%c%c%c'\n", __func__, magic[0], magic[1], magic[2], magic[3]);
-                fclose(file);
+                if(is_qiho) qiho_mm_file_free(&mm_file); else fclose(file);
                 return NULL;
             }
         }
@@ -20612,7 +20734,7 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
 
         if (ctx->header.version == 1) {
             fprintf(stderr, "%s: GGUFv1 is no longer supported. please use a more up-to-date version\n", __func__);
-            fclose(file);
+            if(is_qiho) qiho_mm_file_free(&mm_file); else fclose(file);
             gguf_free(ctx);
             return NULL;
         }
@@ -20625,7 +20747,7 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
 
         if (!ok) {
             fprintf(stderr, "%s: failed to read header\n", __func__);
-            fclose(file);
+            if(is_qiho) qiho_mm_file_free(&mm_file); else fclose(file);
             gguf_free(ctx);
             return NULL;
         }
@@ -20679,7 +20801,7 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
                                     // prevent from integer overflow in the malloc below
                                     if (kv->value.arr.n >= SIZE_MAX/gguf_type_size(kv->value.arr.type)) {
                                         fprintf(stderr, "%s: array size is too large (%" PRIu64 ")\n", __func__, kv->value.arr.n);
-                                        fclose(file);
+                                        if(is_qiho) qiho_mm_file_free(&mm_file); else fclose(file);
                                         gguf_free(ctx);
                                         return NULL;
                                     }
@@ -20693,7 +20815,7 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
                                     // prevent from integer overflow in the malloc below
                                     if (kv->value.arr.n >= SIZE_MAX/sizeof(struct gguf_str)) {
                                         fprintf(stderr, "%s: array size is too large (%" PRIu64 ")\n", __func__, kv->value.arr.n);
-                                        fclose(file);
+                                        if(is_qiho) qiho_mm_file_free(&mm_file); else fclose(file);
                                         gguf_free(ctx);
                                         return NULL;
                                     }
@@ -20718,7 +20840,7 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
 
         if (!ok) {
             fprintf(stderr, "%s: failed to read key-value pairs\n", __func__);
-            fclose(file);
+            if(is_qiho) qiho_mm_file_free(&mm_file); else fclose(file);
             gguf_free(ctx);
             return NULL;
         }
@@ -20751,7 +20873,7 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
 
             if (!ok) {
                 fprintf(stderr, "%s: failed to read tensor info\n", __func__);
-                fclose(file);
+                if(is_qiho) qiho_mm_file_free(&mm_file); else fclose(file);
                 gguf_free(ctx);
                 return NULL;
             }
@@ -20793,7 +20915,7 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
             if (ne % ggml_blck_size(info->type) != 0) {
                 fprintf(stderr, "%s: tensor '%s' of type %d (%s) number of elements (%" PRId64 ") is not a multiple of block size (%d)\n",
                         __func__, info->name.data, (int)info->type, ggml_type_name(info->type), ne, ggml_blck_size(info->type));
-                fclose(file);
+                if(is_qiho) qiho_mm_file_free(&mm_file); else fclose(file);
                 gguf_free(ctx);
                 return NULL;
             }
@@ -20838,7 +20960,7 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
 
             if (!ok) {
                 fprintf(stderr, "%s: failed to read tensor data\n", __func__);
-                fclose(file);
+                if(is_qiho) qiho_mm_file_free(&mm_file); else fclose(file);
                 ggml_free(ctx_data);
                 gguf_free(ctx);
                 return NULL;
@@ -20877,7 +20999,7 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
 
         if (!ok) {
             fprintf(stderr, "%s: failed to read the tensor data\n", __func__);
-            fclose(file);
+            if(is_qiho) qiho_mm_file_free(&mm_file); else fclose(file);
             ggml_free(ctx_data);
             gguf_free(ctx);
             return NULL;
@@ -20886,7 +21008,7 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
         ggml_set_no_alloc(ctx_data, params.no_alloc);
     }
 
-    fclose(file);
+    if(is_qiho) qiho_mm_file_free(&mm_file); else fclose(file);
 
     return ctx;
 }
